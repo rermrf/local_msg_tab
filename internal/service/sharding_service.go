@@ -4,22 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/IBM/sarama"
-	"github.com/rermrf/emo/logger"
-	"gorm.io/gorm"
 	"local_msg_tab/internal/dao"
 	"local_msg_tab/internal/domain"
 	"local_msg_tab/internal/sharding"
 	"time"
+
+	"github.com/IBM/sarama"
+	"github.com/rermrf/emo/logger"
+	"gorm.io/gorm"
 )
 
 type ShardingService struct {
 	DBs map[string]*gorm.DB
 	// 返回 DB
-	Sharding sharding.Sharding
-	producer sarama.SyncProducer
-	MaxTimes int
-	logger   logger.Logger
+	Sharding  sharding.Sharding
+	producer  sarama.SyncProducer
+	MaxTimes  int
+	BatchSize int
+	logger    logger.Logger
 }
 
 func NewShardingService(dbs map[string]*gorm.DB, producer sarama.SyncProducer) *ShardingService {
@@ -160,5 +162,13 @@ func (s *ShardingService) newDmsg(msg domain.Msg) dao.LocalMsg {
 		SendTimes: 0,
 		Utime:     now,
 		Ctime:     now,
+	}
+}
+
+func (s *ShardingService) sendMsgs(ctx context.Context, db *gorm.DB, table string, msgs []dao.LocalMsg) error {
+	msgs := make([]dao.LocalMsg, len(data))
+	var topic string
+	for _, msg := range msgs {
+
 	}
 }
