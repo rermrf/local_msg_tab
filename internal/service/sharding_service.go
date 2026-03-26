@@ -3,70 +3,79 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"local_msg_tab/internal/dao"
 	"local_msg_tab/internal/domain"
 	"local_msg_tab/internal/sharding"
+	"strings"
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/meoying/dlock-go"
 	"github.com/rermrf/emo/logger"
+	"github.com/rermrf/emo/slice"
 	"gorm.io/gorm"
 )
 
 type ShardingService struct {
 	DBs map[string]*gorm.DB
 	// 返回 DB
-	Sharding  sharding.Sharding
-	producer  sarama.SyncProducer
-	MaxTimes  int
-	BatchSize int
-	logger    logger.Logger
+	Sharding     sharding.Sharding
+	producer     sarama.SyncProducer
+	MaxTimes     int
+	BatchSize    int
+	WaitDuration time.Duration
+	executor     Executor
+	lockClient   dlock.Client
+	logger       logger.Logger
 }
 
-func NewShardingService(dbs map[string]*gorm.DB, producer sarama.SyncProducer) *ShardingService {
-	return &ShardingService{}
+func NewShardingService(
+	dbs map[string]*gorm.DB,
+	producer sarama.SyncProducer,
+	lockClient dlock.Client,
+	sharding sharding.Sharding,
+	logger logger.Logger,
+	opts ...ShardingServiceOpt,
+) *ShardingService {
+	svc := &ShardingService{
+		DBs:        dbs,
+		producer:   producer,
+		MaxTimes:   3,
+		BatchSize:  10,
+		Sharding:   sharding,
+		logger:     logger,
+		lockClient: lockClient,
+	}
+	svc.executor = NewCurMsgExecutor(svc, logger)
+	for _, opt := range opts {
+		opt(svc)
+	}
+	return svc
 }
 
-func (s *ShardingService) StartAsyncTask() error {
-	const limit = 10
+type ShardingServiceOpt func(*ShardingService)
+
+func WithBatchExecutor() ShardingServiceOpt {
+	return func(svc *ShardingService) {
+		svc.executor = NewBatchMsgExecutor(svc, svc.logger)
+	}
+}
+
+func (s *ShardingService) StartAsyncTask(ctx context.Context) error {
 	// 一个目标表一个 goroutine
 	for _, dst := range s.Sharding.EffevtiveTablesFunc() {
-		dst := dst
+		task := AsyncTask{
+			waitDuration: s.WaitDuration,
+			executor:     s.executor,
+			db:           s.DBs[dst.DB],
+			battSize:     s.BatchSize,
+			logger:       s.logger,
+			lockClient:   s.lockClient,
+		}
 		go func() {
-			db, ok := s.DBs[dst.DB]
-			if !ok {
-				// 打点日志
-				return
-			}
-			for {
-				// time.Minute.Milliseconds() 根据对同步发送消息的时间估计
-				now := time.Now().UnixMilli() - 3*time.Second.Milliseconds()
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				var msgs []dao.LocalMsg
-				err := db.WithContext(ctx).Table(dst.Table).Where("status = ? AND utime < ?", dao.MsgStatusInit, now).
-					Offset(0).Limit(limit).Find(&msgs).Error
-				cancel()
-				if err != nil {
-					// 要不要结束这个异步任务
-					// 可以考虑进一步区分是偶发性错误，还是持续性错误
-					continue
-				}
-				for _, msg := range msgs {
-					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					err = s.sendMsg(ctx, db, dst.Table, msg)
-					cancel()
-					if err != nil {
-						// 怎么处理？
-						msg.SendTimes++
-						continue
-					}
-				}
-				if len(msgs) == 0 {
-					time.Sleep(1 * time.Second)
-				}
-
-			}
+			task.Start(ctx)
 		}()
 	}
 	return nil
@@ -100,7 +109,7 @@ func (s *ShardingService) execTx(ctx context.Context, db *gorm.DB, table string,
 	return err
 }
 
-// 我希望我作为一个业务方，我调用这个方法就 OK 了
+// ExecTx 我希望我作为一个业务方，我调用这个方法就 OK 了
 func (s *ShardingService) ExecTx(ctx context.Context, shardingKey any, biz func(tx *gorm.DB) (domain.Msg, error)) error {
 	dst := s.Sharding.ShardingFunc(shardingKey)
 	db, ok := s.DBs[dst.DB]
@@ -165,10 +174,147 @@ func (s *ShardingService) newDmsg(msg domain.Msg) dao.LocalMsg {
 	}
 }
 
-func (s *ShardingService) sendMsgs(ctx context.Context, db *gorm.DB, table string, msgs []dao.LocalMsg) error {
-	msgs := make([]dao.LocalMsg, len(data))
+func (s *ShardingService) sendMsgs(ctx context.Context, db *gorm.DB, table string, dmsgs []dao.LocalMsg) error {
+	msgs := make([]domain.Msg, len(dmsgs))
 	var topic string
-	for _, msg := range msgs {
+	for _, dmsg := range dmsgs {
+		var msg domain.Msg
+		err := json.Unmarshal(dmsg.Data, &msgs)
+		if err != nil {
+			return fmt.Errorf("提取消息内容失败: %w", err)
+		}
+		topic = msg.Topic
+		msgs = append(msgs, msg)
+	}
+	// 发送消息
+	err := s.producer.SendMessages(slice.Map(msgs, func(idx int, src domain.Msg) *sarama.ProducerMessage {
+		return newSaramaProducerMsg(src)
+	}))
 
+	failMsgs := make([]dao.LocalMsg, 0)
+	initMsgs := make([]dao.LocalMsg, 0)
+	successMsgs := make([]dao.LocalMsg, 0)
+	failFields := map[string]interface{}{
+		"utime":      time.Now().UnixMilli(),
+		"send_times": gorm.Expr("send_times + 1"),
+		"status":     dao.MsgStatusFail,
+	}
+	initFields := map[string]interface{}{
+		"utime":      time.Now().UnixMilli(),
+		"send_times": gorm.Expr("send_times + 1"),
+		"status":     dao.MsgStatusInit,
+	}
+	successFields := map[string]interface{}{
+		"utime":      time.Now().UnixMilli(),
+		"send_times": gorm.Expr("send_times + 1"),
+		"status":     dao.MsgStatusSuccess,
+	}
+	if err != nil {
+		var errs sarama.ProducerErrors
+		if errors.As(err, &errs) {
+			var perr error
+			failMsgs, initMsgs, successMsgs, perr = s.getPartitionMsgs(dmsgs, errs)
+			if perr != nil {
+				return perr
+			}
+		} else {
+			failMsgs, initMsgs = s.getFailMsgs(dmsgs)
+		}
+	} else {
+		successMsgs = dmsgs
+	}
+	if len(successMsgs) > 0 {
+		err = s.updateMsgs(ctx, db, table, successMsgs, successFields, topic)
+		if err != nil {
+			return err
+		}
+	}
+	if len(failMsgs) > 0 {
+		// TODO 使用一个独立的 counter 来记录出现了补偿任务补发最终失败的情况
+		s.logger.Error("发送消息失败", logger.String("topic", topic), logger.String("keys", s.getKeystr(failMsgs)))
+		err = s.updateMsgs(ctx, db, table, failMsgs, failFields, topic)
+		if err != nil {
+			return err
+		}
+	}
+	if len(initMsgs) > 0 {
+		s.logger.Error("发送消息失败", logger.String("topic", topic), logger.String("keys", s.getKeystr(initMsgs)))
+		err = s.updateMsgs(ctx, db, table, initMsgs, initFields, topic)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// 部分失败获取消息
+func (s *ShardingService) getPartitionMsgs(dmsgs []dao.LocalMsg, errMsgs sarama.ProducerErrors) ([]dao.LocalMsg, []dao.LocalMsg, []dao.LocalMsg, error) {
+	failMsgs := make([]dao.LocalMsg, 0, len(errMsgs))
+	initMsgs := make([]dao.LocalMsg, 0, len(errMsgs))
+	successMsgs := make([]dao.LocalMsg, 0, len(dmsgs)-len(errMsgs))
+	failMsgMap := make(map[string]struct{})
+	for _, errMsg := range errMsgs {
+		keyByte, err := errMsg.Msg.Key.Encode()
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("提取消息内容失败 %w", err)
+		}
+		failMsgMap[string(keyByte)] = struct{}{}
+	}
+	for _, dmsg := range dmsgs {
+		if _, ok := failMsgMap[string(dmsg.Key)]; ok {
+			if dmsg.SendTimes+1 >= s.MaxTimes {
+				failMsgs = append(failMsgs, dmsg)
+			} else {
+				initMsgs = append(initMsgs, dmsg)
+			}
+		} else {
+			successMsgs = append(successMsgs, dmsg)
+		}
+	}
+	return failMsgs, initMsgs, successMsgs, nil
+}
+
+// 获取完全失败的消息
+func (s *ShardingService) getFailMsgs(dmsgs []dao.LocalMsg) ([]dao.LocalMsg, []dao.LocalMsg) {
+	failMsgs := make([]dao.LocalMsg, 0, len(dmsgs))
+	initMsgs := make([]dao.LocalMsg, 0, len(dmsgs))
+	for _, dmsg := range dmsgs {
+		if dmsg.SendTimes+1 >= s.MaxTimes {
+			failMsgs = append(failMsgs, dmsg)
+		} else {
+			initMsgs = append(initMsgs, dmsg)
+		}
+	}
+	return failMsgs, initMsgs
+}
+
+func (s *ShardingService) updateMsgs(ctx context.Context, db *gorm.DB, table string, dmsgs []dao.LocalMsg, fields map[string]interface{}, topic string) error {
+	err := db.WithContext(ctx).Table(table).Where("`key` in ?", s.getKeys(dmsgs)).Updates(fields).Error
+	if err != nil {
+		return fmt.Errorf("发送消息但是更新消息失败 %w, topic %s, keys %s",
+			err, topic, s.getKeys(dmsgs))
+	}
+	return nil
+}
+
+func (s *ShardingService) getKeys(dmsgs []dao.LocalMsg) []string {
+	return slice.Map(dmsgs, func(idx int, src dao.LocalMsg) string {
+		return src.Key
+	})
+}
+
+func (s *ShardingService) getKeystr(msgs []dao.LocalMsg) string {
+	keys := slice.Map(msgs, func(idx int, src dao.LocalMsg) string {
+		return src.Key
+	})
+	return strings.Join(keys, ",")
+}
+
+func newSaramaProducerMsg(msg domain.Msg) *sarama.ProducerMessage {
+	return &sarama.ProducerMessage{
+		Topic:     msg.Topic,
+		Partition: msg.Partition,
+		Key:       sarama.StringEncoder(msg.Key),
+		Value:     sarama.ByteEncoder(msg.Content),
 	}
 }
