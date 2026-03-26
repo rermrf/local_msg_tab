@@ -36,7 +36,7 @@ func NewCurMsgExecutor(svc *ShardingService, logger logger.Logger) *CurMsgExecut
 }
 
 func (c *CurMsgExecutor) Exec(ctx context.Context, db *gorm.DB, table string) (int, error) {
-	data, err := finSuspendMsg(ctx, db, time.Second*30, table, 0, c.svc.BatchSize)
+	data, err := finSuspendMsg(ctx, db, c.svc.WaitDuration, table, 0, c.svc.BatchSize)
 	if err != nil {
 		c.logger.Error("查询数据失败", logger.String("err", err.Error()))
 		return 0, fmt.Errorf("查询数据失败 %w", err)
@@ -67,7 +67,7 @@ func NewBatchMsgExecutor(svc *ShardingService, logger logger.Logger) *BatchMsgEx
 }
 
 func (b *BatchMsgExecutor) Exec(ctx context.Context, db *gorm.DB, table string) (int, error) {
-	data, err := finSuspendMsg(ctx, db, time.Second*30, table, 0, b.svc.BatchSize)
+	data, err := finSuspendMsg(ctx, db, b.svc.WaitDuration, table, 0, b.svc.BatchSize)
 	if err != nil {
 		b.logger.Error("查询数据失败", logger.String("err", err.Error()))
 		return 0, fmt.Errorf("查询数据失败 %w", err)

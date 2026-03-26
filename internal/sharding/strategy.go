@@ -7,7 +7,7 @@ func NewNoShard(table string) Sharding {
 				Table: table,
 			}
 		},
-		EffevtiveTablesFunc: func() []Dst {
+		EffectiveTablesFunc: func() []Dst {
 			return []Dst{
 				{
 					Table: table,

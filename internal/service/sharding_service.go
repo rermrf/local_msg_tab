@@ -65,13 +65,13 @@ func WithBatchExecutor() ShardingServiceOpt {
 
 func (s *ShardingService) StartAsyncTask(ctx context.Context) error {
 	// 一个目标表一个 goroutine
-	for _, dst := range s.Sharding.EffevtiveTablesFunc() {
+	for _, dst := range s.Sharding.EffectiveTablesFunc() {
 		task := AsyncTask{
 			waitDuration: s.WaitDuration,
 			executor:     s.executor,
 			db:           s.DBs[dst.DB],
 			dst:          dst,
-			battSize:     s.BatchSize,
+			batchSize:    s.BatchSize,
 			logger:       s.logger,
 			lockClient:   s.lockClient,
 		}
@@ -105,7 +105,7 @@ func (s *ShardingService) execTx(ctx context.Context, db *gorm.DB, table string,
 		// 站在业务方的角度来讲，它没有失败，他的业务已经在上面那个事务中已经执行成功
 		// 打印日志，而后不用管
 		s.logger.Error("发送消息失败", logger.Any("error", err))
-		return fmt.Errorf("send msg: %w, cause %w", syncSendMsgError, err)
+		return fmt.Errorf("发送消息: %w, 原因 %w", syncSendMsgError, err)
 	}
 	return err
 }
@@ -252,7 +252,7 @@ func (s *ShardingService) getPartitionMsgs(dmsgs []dao.LocalMsg, errMsgs sarama.
 	for _, errMsg := range errMsgs {
 		id, ok := errMsg.Msg.Metadata.(int64)
 		if !ok {
-			err := fmt.Errorf("unexpected producer metadata type %T", errMsg.Msg.Metadata)
+			err := fmt.Errorf("生产者消息 metadata 类型不匹配 %T", errMsg.Msg.Metadata)
 			return nil, nil, nil, fmt.Errorf("提取消息内容失败 %w", err)
 		}
 		failMsgMap[id] = struct{}{}

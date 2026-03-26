@@ -18,7 +18,7 @@ type AsyncTask struct {
 	executor     Executor
 	db           *gorm.DB
 	logger       logger.Logger
-	battSize     int
+	batchSize    int
 	lockClient   dlock.Client
 }
 
