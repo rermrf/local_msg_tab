@@ -83,7 +83,7 @@ func (task *AsyncTask) refreshAndLoop(ctx context.Context, lock dlock.Lock) {
 		// 手动控制每一批次循环开始就续约分布式锁
 		// 而后控制每一批次的超时时间
 		// 这样就可以确保不会出现分布式锁过期，但是任务还在运行的情况
-		err := lock.Lock(refreshCtx)
+		err := lock.Refresh(refreshCtx)
 		cancel()
 		if err != nil {
 			task.logger.Error("分布式锁续约失败，直接返回", logger.Error(err))

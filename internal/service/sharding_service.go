@@ -70,6 +70,7 @@ func (s *ShardingService) StartAsyncTask(ctx context.Context) error {
 			waitDuration: s.WaitDuration,
 			executor:     s.executor,
 			db:           s.DBs[dst.DB],
+			dst:          dst,
 			battSize:     s.BatchSize,
 			logger:       s.logger,
 			lockClient:   s.lockClient,
@@ -131,10 +132,7 @@ func (s *ShardingService) sendMsg(ctx context.Context, db *gorm.DB, table string
 		return fmt.Errorf("unmarshal msg: %w", err)
 	}
 	// 发送消息
-	_, _, err = s.producer.SendMessage(&sarama.ProducerMessage{
-		Topic: msg.Topic,
-		Value: sarama.StringEncoder(msg.Content),
-	})
+	_, _, err = s.producer.SendMessage(newSaramaProducerMsg(msg))
 	times := dmsg.SendTimes + 1
 	var updates = map[string]interface{}{
 		"utime":      time.Now().UnixMilli(),
@@ -175,21 +173,19 @@ func (s *ShardingService) newDmsg(msg domain.Msg) dao.LocalMsg {
 }
 
 func (s *ShardingService) sendMsgs(ctx context.Context, db *gorm.DB, table string, dmsgs []dao.LocalMsg) error {
-	msgs := make([]domain.Msg, len(dmsgs))
+	producerMsgs := make([]*sarama.ProducerMessage, 0, len(dmsgs))
 	var topic string
 	for _, dmsg := range dmsgs {
 		var msg domain.Msg
-		err := json.Unmarshal(dmsg.Data, &msgs)
+		err := json.Unmarshal(dmsg.Data, &msg)
 		if err != nil {
 			return fmt.Errorf("提取消息内容失败: %w", err)
 		}
 		topic = msg.Topic
-		msgs = append(msgs, msg)
+		producerMsgs = append(producerMsgs, newSaramaProducerMsgWithMetadata(dmsg.ID, msg))
 	}
 	// 发送消息
-	err := s.producer.SendMessages(slice.Map(msgs, func(idx int, src domain.Msg) *sarama.ProducerMessage {
-		return newSaramaProducerMsg(src)
-	}))
+	err := s.producer.SendMessages(producerMsgs)
 
 	failMsgs := make([]dao.LocalMsg, 0)
 	initMsgs := make([]dao.LocalMsg, 0)
@@ -252,16 +248,17 @@ func (s *ShardingService) getPartitionMsgs(dmsgs []dao.LocalMsg, errMsgs sarama.
 	failMsgs := make([]dao.LocalMsg, 0, len(errMsgs))
 	initMsgs := make([]dao.LocalMsg, 0, len(errMsgs))
 	successMsgs := make([]dao.LocalMsg, 0, len(dmsgs)-len(errMsgs))
-	failMsgMap := make(map[string]struct{})
+	failMsgMap := make(map[int64]struct{}, len(errMsgs))
 	for _, errMsg := range errMsgs {
-		keyByte, err := errMsg.Msg.Key.Encode()
-		if err != nil {
+		id, ok := errMsg.Msg.Metadata.(int64)
+		if !ok {
+			err := fmt.Errorf("unexpected producer metadata type %T", errMsg.Msg.Metadata)
 			return nil, nil, nil, fmt.Errorf("提取消息内容失败 %w", err)
 		}
-		failMsgMap[string(keyByte)] = struct{}{}
+		failMsgMap[id] = struct{}{}
 	}
 	for _, dmsg := range dmsgs {
-		if _, ok := failMsgMap[string(dmsg.Key)]; ok {
+		if _, ok := failMsgMap[dmsg.ID]; ok {
 			if dmsg.SendTimes+1 >= s.MaxTimes {
 				failMsgs = append(failMsgs, dmsg)
 			} else {
@@ -289,10 +286,10 @@ func (s *ShardingService) getFailMsgs(dmsgs []dao.LocalMsg) ([]dao.LocalMsg, []d
 }
 
 func (s *ShardingService) updateMsgs(ctx context.Context, db *gorm.DB, table string, dmsgs []dao.LocalMsg, fields map[string]interface{}, topic string) error {
-	err := db.WithContext(ctx).Table(table).Where("`key` in ?", s.getKeys(dmsgs)).Updates(fields).Error
+	err := db.WithContext(ctx).Table(table).Where("id IN ?", s.getIDs(dmsgs)).Updates(fields).Error
 	if err != nil {
 		return fmt.Errorf("发送消息但是更新消息失败 %w, topic %s, keys %s",
-			err, topic, s.getKeys(dmsgs))
+			err, topic, fmt.Sprint(s.getIDs(dmsgs)))
 	}
 	return nil
 }
@@ -300,6 +297,12 @@ func (s *ShardingService) updateMsgs(ctx context.Context, db *gorm.DB, table str
 func (s *ShardingService) getKeys(dmsgs []dao.LocalMsg) []string {
 	return slice.Map(dmsgs, func(idx int, src dao.LocalMsg) string {
 		return src.Key
+	})
+}
+
+func (s *ShardingService) getIDs(dmsgs []dao.LocalMsg) []int64 {
+	return slice.Map(dmsgs, func(idx int, src dao.LocalMsg) int64 {
+		return src.ID
 	})
 }
 
@@ -317,4 +320,10 @@ func newSaramaProducerMsg(msg domain.Msg) *sarama.ProducerMessage {
 		Key:       sarama.StringEncoder(msg.Key),
 		Value:     sarama.ByteEncoder(msg.Content),
 	}
+}
+
+func newSaramaProducerMsgWithMetadata(id int64, msg domain.Msg) *sarama.ProducerMessage {
+	producerMsg := newSaramaProducerMsg(msg)
+	producerMsg.Metadata = id
+	return producerMsg
 }

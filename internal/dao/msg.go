@@ -26,7 +26,7 @@ func (dao *MsgDao) Get(ctx context.Context, table string, id int64) (LocalMsg, e
 	return result, err
 }
 
-func (dao *MsgDAO) List(ctx context.Context, q Query) ([]LocalMsg, error) {
+func (dao *MsgDao) List(ctx context.Context, q Query) ([]LocalMsg, error) {
 	var res []LocalMsg
 	db := dao.db.WithContext(ctx).
 		Offset(q.Offset).

@@ -5,15 +5,20 @@ go 1.25.0
 require (
 	github.com/IBM/sarama v1.47.0
 	github.com/meoying/dlock-go v0.0.0-20250530125835-af969a8b419d
+	github.com/redis/go-redis/v9 v9.17.2
 	github.com/rermrf/emo v0.0.0-20251218080950-debd5e00e1b1
 	golang.org/x/sync v0.20.0
 	gorm.io/gorm v1.31.1
 )
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/eapache/queue v1.1.0 // indirect
+	github.com/ecodeclub/ekit v0.0.9-0.20250308133608-b832b6e50738 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
